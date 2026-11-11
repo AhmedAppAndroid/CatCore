@@ -27,15 +27,12 @@ jobs:
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
-      - name: Accept Android Licenses
-        shell: bash
-        run: |
-          set +o pipefail
-          yes | sdkmanager --licenses
-
-      - name: Install SDK Packages
+      - name: Install Android SDK Packages
         run: |
           sdkmanager --install \
             "platforms;android-34" \
@@ -47,88 +44,66 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Extract All ZIP Archives
+      - name: Extract ZIP Archives
         shell: bash
         run: |
-          set -euo pipefail
-
-          DEST="$RUNNER_TEMP/catcore-archives"
-          mkdir -p "$DEST"
+          set -e
+          mkdir -p "$RUNNER_TEMP/catcore-source"
 
           COUNT=0
 
           while IFS= read -r -d '' FILE; do
             COUNT=$((COUNT + 1))
-            echo "Extracting: $FILE"
-
-            unzip -oq "$FILE" -d "$DEST/archive-$COUNT"
-
+            echo "Extracting $FILE"
+            mkdir -p "$RUNNER_TEMP/catcore-source/$COUNT"
+            unzip -oq "$FILE" \
+              -d "$RUNNER_TEMP/catcore-source/$COUNT"
           done < <(
-            find "$GITHUB_WORKSPACE" \
-              -type f -iname '*.zip' \
-              -not -path '*/.git/*' \
-              -print0
+            find . -type f -iname '*.zip' \
+              -not -path '*/.git/*' -print0
           )
 
-          echo "ZIP archives extracted: $COUNT"
-
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::warning::No ZIP archives found"
-          fi
+          echo "Extracted $COUNT ZIP files"
 
       - name: Find Android Project
         id: locate
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          PROJECT_DIR=""
+          PROJECT=""
 
           for ROOT in \
-            "$RUNNER_TEMP/catcore-archives" \
+            "$RUNNER_TEMP/catcore-source" \
             "$GITHUB_WORKSPACE"
           do
-            while IFS= read -r -d '' SETTINGS; do
-
-              DIR="$(dirname "$SETTINGS")"
+            while IFS= read -r -d '' FILE; do
+              DIR="$(dirname "$FILE")"
 
               if [ -f "$DIR/app/build.gradle.kts" ] || \
                  [ -f "$DIR/app/build.gradle" ]; then
-
-                PROJECT_DIR="$DIR"
+                PROJECT="$DIR"
                 break 2
               fi
-
             done < <(
               find "$ROOT" -type f \
                 \( -name 'settings.gradle.kts' \
                 -o -name 'settings.gradle' \) \
-                -not -path '*/.git/*' \
-                -not -path '*/build/*' \
-                -print0
+                -not -path '*/.git/*' -print0
             )
           done
 
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "::error::Android Gradle project not found"
-
-            echo "ZIP files:"
-            find "$GITHUB_WORKSPACE" -type f -iname '*.zip'
-
-            echo "Gradle files:"
-            find "$RUNNER_TEMP/catcore-archives" \
-              "$GITHUB_WORKSPACE" \
-              -type f -name 'settings.gradle*' \
-              -not -path '*/.git/*'
-
+          if [ -z "$PROJECT" ]; then
+            echo "::error::Android project not found"
+            find "$RUNNER_TEMP/catcore-source" \
+              -type f | head -100
             exit 1
           fi
 
-          echo "Found project: $PROJECT_DIR"
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Found project: $PROJECT"
+          echo "project_dir=$PROJECT" >> "$GITHUB_OUTPUT"
 
-      - name: Build CatCore APK
-        shell: bash
+      - name: Build APK
         run: |
           gradle \
             -p "${{ steps.locate.outputs.project_dir }}" \
@@ -136,23 +111,28 @@ jobs:
             --no-daemon \
             --stacktrace
 
-      - name: Verify APK
+      - name: Find APK
+        id: apk
         shell: bash
         run: |
-          APK_DIR="${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/debug"
+          APK=$(find \
+            "${{ steps.locate.outputs.project_dir }}" \
+            -type f -path '*/build/outputs/apk/debug/*.apk' \
+            -print -quit)
 
-          if ! ls "$APK_DIR"/*.apk >/dev/null 2>&1; then
-            echo "::error::APK was not generated"
+          if [ -z "$APK" ]; then
+            echo "::error::APK not generated"
             exit 1
           fi
 
-          ls -lh "$APK_DIR"/*.apk
+          echo "APK found: $APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
 
       - name: Upload CatCore APK
         uses: actions/upload-artifact@v4
         with:
           name: CatCore-APK
-          path: ${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+          path: ${{ steps.apk.outputs.path }}
           retention-days: 14
+          if-no-files-found: error
           
