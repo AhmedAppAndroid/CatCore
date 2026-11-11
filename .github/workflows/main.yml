@@ -1,3 +1,4 @@
+
 name: Build CatCore APK
 
 on:
@@ -12,6 +13,7 @@ permissions:
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
@@ -25,45 +27,65 @@ jobs:
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
-      - name: Install Android SDK
+      - name: Accept Android SDK Licenses
+        shell: bash
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          set +o pipefail
+          yes | sdkmanager --licenses
 
-      - name: Setup Gradle 8.9
+      - name: Install Android SDK Packages
+        run: |
+          sdkmanager --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "platform-tools"
+
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Detect Project Folder
-        id: detect
+      - name: Detect CatCore Project
+        id: project
+        shell: bash
         run: |
-          if [ -f "settings.gradle.kts" ]; then
+          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
             echo "project_dir=." >> "$GITHUB_OUTPUT"
-            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
-          elif [ -f "CatCore/settings.gradle.kts" ]; then
+          elif [ -f "CatCore/settings.gradle.kts" ] || [ -f "CatCore/settings.gradle" ]; then
             echo "project_dir=CatCore" >> "$GITHUB_OUTPUT"
-            echo "PROJECT_DIR=CatCore" >> "$GITHUB_ENV"
           else
-            echo "Project files not found!"
+            echo "::error::Gradle project not found!"
             exit 1
           fi
 
-      - name: Check QEMU Files
+      - name: Check QEMU and Firmware
         run: |
-          test -f "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libqemu-system-x86_64.so" || echo "::warning::QEMU engine missing"
-          test -f "$PROJECT_DIR/app/src/main/assets/firmware/OVMF_CODE.fd" || echo "::warning::UEFI firmware missing"
+          DIR="${{ steps.project.outputs.project_dir }}"
 
-      - name: Build CatCore APK
+          if [ ! -f "$DIR/app/src/main/jniLibs/arm64-v8a/libqemu-system-x86_64.so" ]; then
+            echo "::warning::QEMU engine is missing"
+          fi
+
+          if [ ! -f "$DIR/app/src/main/assets/firmware/OVMF_CODE.fd" ]; then
+            echo "::warning::UEFI firmware is missing"
+          fi
+
+      - name: Build CatCore Debug APK
         run: |
-          cd "$PROJECT_DIR"
-          gradle assembleDebug --no-daemon
+          gradle -p "${{ steps.project.outputs.project_dir }}" \
+            assembleDebug --no-daemon
 
-      - name: Upload CatCore APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: CatCore-APK
-          path: ${{ steps.detect.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
+          path: |
+            **/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          retention-days: 14
           
