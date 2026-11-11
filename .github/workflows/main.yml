@@ -13,11 +13,11 @@ permissions:
 
 jobs:
   build:
-    name: Build Android APK
+    name: Build CatCore APK
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Source
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Java 17
@@ -27,18 +27,15 @@ jobs:
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
+        uses: android-actions/setup-android@v3
 
-      - name: Accept Android SDK Licenses
+      - name: Accept Android Licenses
         shell: bash
         run: |
           set +o pipefail
           yes | sdkmanager --licenses
 
-      - name: Install Android SDK Packages
+      - name: Install SDK Packages
         run: |
           sdkmanager --install \
             "platforms;android-34" \
@@ -48,44 +45,114 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.7'
 
-      - name: Detect CatCore Project
-        id: project
+      - name: Extract All ZIP Archives
         shell: bash
         run: |
-          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
-            echo "project_dir=." >> "$GITHUB_OUTPUT"
-          elif [ -f "CatCore/settings.gradle.kts" ] || [ -f "CatCore/settings.gradle" ]; then
-            echo "project_dir=CatCore" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Gradle project not found!"
+          set -euo pipefail
+
+          DEST="$RUNNER_TEMP/catcore-archives"
+          mkdir -p "$DEST"
+
+          COUNT=0
+
+          while IFS= read -r -d '' FILE; do
+            COUNT=$((COUNT + 1))
+            echo "Extracting: $FILE"
+
+            unzip -oq "$FILE" -d "$DEST/archive-$COUNT"
+
+          done < <(
+            find "$GITHUB_WORKSPACE" \
+              -type f -iname '*.zip' \
+              -not -path '*/.git/*' \
+              -print0
+          )
+
+          echo "ZIP archives extracted: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::warning::No ZIP archives found"
+          fi
+
+      - name: Find Android Project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR=""
+
+          for ROOT in \
+            "$RUNNER_TEMP/catcore-archives" \
+            "$GITHUB_WORKSPACE"
+          do
+            while IFS= read -r -d '' SETTINGS; do
+
+              DIR="$(dirname "$SETTINGS")"
+
+              if [ -f "$DIR/app/build.gradle.kts" ] || \
+                 [ -f "$DIR/app/build.gradle" ]; then
+
+                PROJECT_DIR="$DIR"
+                break 2
+              fi
+
+            done < <(
+              find "$ROOT" -type f \
+                \( -name 'settings.gradle.kts' \
+                -o -name 'settings.gradle' \) \
+                -not -path '*/.git/*' \
+                -not -path '*/build/*' \
+                -print0
+            )
+          done
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::Android Gradle project not found"
+
+            echo "ZIP files:"
+            find "$GITHUB_WORKSPACE" -type f -iname '*.zip'
+
+            echo "Gradle files:"
+            find "$RUNNER_TEMP/catcore-archives" \
+              "$GITHUB_WORKSPACE" \
+              -type f -name 'settings.gradle*' \
+              -not -path '*/.git/*'
+
             exit 1
           fi
 
-      - name: Check QEMU and Firmware
-        run: |
-          DIR="${{ steps.project.outputs.project_dir }}"
+          echo "Found project: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-          if [ ! -f "$DIR/app/src/main/jniLibs/arm64-v8a/libqemu-system-x86_64.so" ]; then
-            echo "::warning::QEMU engine is missing"
+      - name: Build CatCore APK
+        shell: bash
+        run: |
+          gradle \
+            -p "${{ steps.locate.outputs.project_dir }}" \
+            assembleDebug \
+            --no-daemon \
+            --stacktrace
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          APK_DIR="${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/debug"
+
+          if ! ls "$APK_DIR"/*.apk >/dev/null 2>&1; then
+            echo "::error::APK was not generated"
+            exit 1
           fi
 
-          if [ ! -f "$DIR/app/src/main/assets/firmware/OVMF_CODE.fd" ]; then
-            echo "::warning::UEFI firmware is missing"
-          fi
+          ls -lh "$APK_DIR"/*.apk
 
-      - name: Build CatCore Debug APK
-        run: |
-          gradle -p "${{ steps.project.outputs.project_dir }}" \
-            assembleDebug --no-daemon
-
-      - name: Upload APK
+      - name: Upload CatCore APK
         uses: actions/upload-artifact@v4
         with:
           name: CatCore-APK
-          path: |
-            **/build/outputs/apk/debug/*.apk
+          path: ${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
           
