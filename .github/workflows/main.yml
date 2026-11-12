@@ -15,7 +15,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -25,86 +25,412 @@ jobs:
         shell: bash
         run: |
           set -e
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          MANAGER="$(command -v sdkmanager || true)"
 
-          SDK_MANAGER="$(command -v sdkmanager || true)"
-
-          if [ -z "$SDK_MANAGER" ]; then
-            SDK_MANAGER="$(find "$SDK_ROOT/cmdline-tools" \
+          if [ -z "$MANAGER" ]; then
+            MANAGER="$(find "$SDK/cmdline-tools" \
               -type f -path '*/bin/sdkmanager' \
               2>/dev/null | sort -V | tail -n 1)"
           fi
 
-          if [ -z "$SDK_MANAGER" ] || [ ! -x "$SDK_MANAGER" ]; then
-            echo "::error::sdkmanager not found"
-            exit 1
-          fi
+          test -x "$MANAGER" || exit 1
 
-          yes | "$SDK_MANAGER" \
-            --sdk_root="$SDK_ROOT" --licenses \
-            > /tmp/licenses.log 2>&1 || true
+          yes | "$MANAGER" \
+            --sdk_root="$SDK" --licenses \
+            > /tmp/sdk-licenses.log 2>&1 || true
 
-          tail -n 12 /tmp/licenses.log
-
-          "$SDK_MANAGER" --sdk_root="$SDK_ROOT" \
+          "$MANAGER" --sdk_root="$SDK" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "platform-tools"
 
-      - name: Set up Gradle
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y patchelf binutils
 
       - name: Download and package QEMU ARM64
+        shell: bash
         run: |
-          python3 tools/bundle_qemu.py --project .
+          set -euo pipefail
+
+          cat > /tmp/bundle_qemu.py <<'PY'
+          import argparse
+          import hashlib
+          import lzma
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+          from urllib.request import urlopen
+          from urllib.parse import quote
+
+          REPO = "https://packages.termux.dev/apt/termux-main"
+          INDEX = REPO + "/dists/stable/main/binary-aarch64/Packages.xz"
+          PREFIX = Path("data/data/com.termux/files/usr")
+
+          SYSTEM_LIBS = {
+              "libc.so", "libdl.so", "libm.so",
+              "liblog.so", "libandroid.so", "libz.so",
+              "libstdc++.so", "libEGL.so",
+              "libGLESv2.so", "libGLESv3.so",
+              "libOpenSLES.so", "libvulkan.so"
+          }
+
+          def download(url):
+              for attempt in range(4):
+                  try:
+                      with urlopen(url, timeout=90) as r:
+                          return r.read()
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                      time.sleep(attempt + 1)
+
+          def parse_index(data):
+              packages = {}
+              provides = {}
+
+              for section in data.decode().split("\n\n"):
+                  fields = {}
+                  last = None
+
+                  for line in section.splitlines():
+                      if line.startswith(" ") and last:
+                          fields[last] += " " + line.strip()
+                      elif ": " in line:
+                          k, v = line.split(": ", 1)
+                          fields[k] = v.strip()
+                          last = k
+
+                  if fields.get("Package"):
+                      packages[fields["Package"]] = fields
+
+              for name, p in packages.items():
+                  for token in p.get("Provides", "").split(","):
+                      alias = re.sub(r"\s*\(.*", "", token).strip()
+                      if alias:
+                          provides.setdefault(alias, name)
+
+              return packages, provides
+
+          def dependency(token, packages, provides):
+              for alternative in token.split("|"):
+                  name = re.split(
+                      r"[ (\[]", alternative.strip(), maxsplit=1
+                  )[0]
+
+                  if name in packages:
+                      return name
+                  if name in provides:
+                      return provides[name]
+
+              return None
+
+          def run(*cmd):
+              return subprocess.check_output(
+                  cmd, text=True, stderr=subprocess.STDOUT
+              ).strip()
+
+          def is_elf(path):
+              if not path.is_file():
+                  return False
+              with path.open("rb") as f:
+                  return f.read(4) == b"\x7fELF"
+
+          def needed(path):
+              return [
+                  x.strip() for x in
+                  run("patchelf", "--print-needed", str(path)).splitlines()
+                  if x.strip()
+              ]
+
+          def canonical(name):
+              m = re.match(
+                  r"^(lib[^/]+?\.so)(?:\.[0-9].*)?$", name
+              )
+              return m.group(1) if m else None
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--project", default=".")
+              args = parser.parse_args()
+
+              project = Path(args.project).resolve()
+
+              libs = project / "app/src/main/jniLibs/arm64-v8a"
+              firmware = project / "app/src/main/assets/firmware"
+
+              libs.mkdir(parents=True, exist_ok=True)
+              firmware.mkdir(parents=True, exist_ok=True)
+
+              index = lzma.decompress(download(INDEX))
+              packages, provides = parse_index(index)
+
+              print("Available packages:", len(packages), flush=True)
+
+              queue = [
+                  "qemu-system-x86-64-headless",
+                  "qemu-common",
+                  "qemu-system-i386-headless"
+              ]
+
+              visited = set()
+              selected = []
+
+              while queue:
+                  name = queue.pop(0)
+
+                  if name in visited:
+                      continue
+
+                  if name not in packages:
+                      raise RuntimeError("Missing package: " + name)
+
+                  visited.add(name)
+                  package = packages[name]
+                  selected.append(package)
+
+                  for token in package.get("Depends", "").split(","):
+                      if not token.strip():
+                          continue
+
+                      dep = dependency(token, packages, provides)
+                      if dep and dep not in visited:
+                          queue.append(dep)
+
+              print("Packages to download:", len(selected), flush=True)
+
+              with tempfile.TemporaryDirectory() as tmp:
+                  tmp = Path(tmp)
+                  root = tmp / "unpacked"
+                  root.mkdir()
+
+                  for i, package in enumerate(selected, 1):
+                      path = package["Filename"].lstrip("/")
+
+                      if not path.startswith("pool/"):
+                          raise RuntimeError("Unexpected package path")
+
+                      url = REPO + "/" + quote(path, safe="/")
+                      data = download(url)
+
+                      expected = package.get("SHA256")
+                      actual = hashlib.sha256(data).hexdigest()
+
+                      if not expected or actual.lower() != expected.lower():
+                          raise RuntimeError(
+                              "Checksum failed: " + package["Package"]
+                          )
+
+                      deb = tmp / f"{i:03d}.deb"
+                      deb.write_bytes(data)
+
+                      subprocess.run(
+                          ["dpkg-deb", "-x", str(deb), str(root)],
+                          check=True
+                      )
+
+                      deb.unlink()
+
+                      print(
+                          f"[{i}/{len(selected)}] {package['Package']}",
+                          flush=True
+                      )
+
+                  prefix = root / PREFIX
+                  binary = prefix / "bin/qemu-system-x86_64"
+
+                  if not is_elf(binary):
+                      raise RuntimeError("QEMU x86_64 executable missing")
+
+                  source_libs = prefix / "lib"
+
+                  if not source_libs.is_dir():
+                      raise RuntimeError("Library directory missing")
+
+                  copies = {}
+
+                  for p in source_libs.rglob("*"):
+                      if p.is_file() and is_elf(p):
+                          name = canonical(p.name)
+                          if name:
+                              copies[name] = p
+
+                  if len(copies) < 5:
+                      raise RuntimeError("QEMU dependencies missing")
+
+                  destination = libs / "libqemu-system-x86_64.so"
+                  shutil.copy2(binary, destination)
+
+                  for name, source in sorted(copies.items()):
+                      if name not in SYSTEM_LIBS:
+                          shutil.copy2(source, libs / name)
+
+                  elf_files = [
+                      destination,
+                      *sorted(
+                          p for p in libs.glob("lib*.so")
+                          if p != destination
+                      )
+                  ]
+
+                  aliases = {}
+
+                  for elf in elf_files:
+                      for name in needed(elf):
+                          short = canonical(name)
+                          if (
+                              short and short != name
+                              and (libs / short).is_file()
+                          ):
+                              aliases[name] = short
+
+                  for elf in elf_files:
+                      subprocess.run(
+                          ["patchelf", "--remove-rpath", str(elf)],
+                          check=True
+                      )
+
+                      for old in needed(elf):
+                          if old in aliases:
+                              subprocess.run(
+                                  [
+                                      "patchelf", "--replace-needed",
+                                      old, aliases[old], str(elf)
+                                  ],
+                                  check=True
+                              )
+
+                      if elf != destination:
+                          subprocess.run(
+                              [
+                                  "patchelf", "--set-soname",
+                                  elf.name, str(elf)
+                              ],
+                              check=True
+                          )
+
+                  missing = {
+                      lib
+                      for elf in elf_files
+                      for lib in needed(elf)
+                      if lib not in SYSTEM_LIBS
+                      and not (libs / lib).is_file()
+                  }
+
+                  if missing:
+                      raise RuntimeError(
+                          "Missing linked libraries: "
+                          + ", ".join(sorted(missing))
+                      )
+
+                  interpreter = run(
+                      "patchelf", "--print-interpreter",
+                      str(destination)
+                  )
+
+                  if interpreter != "/system/bin/linker64":
+                      raise RuntimeError(
+                          "Incorrect Android ELF interpreter: "
+                          + interpreter
+                      )
+
+                  if "AArch64" not in run(
+                      "readelf", "-h", str(destination)
+                  ):
+                      raise RuntimeError("QEMU is not ARM64")
+
+                  shared = prefix / "share/qemu"
+
+                  if not shared.is_dir():
+                      raise RuntimeError("QEMU ROM directory missing")
+
+                  code = shared / "edk2-x86_64-code.fd"
+                  vars_file = shared / "edk2-i386-vars.fd"
+
+                  if not code.is_file() or not vars_file.is_file():
+                      raise RuntimeError("UEFI firmware missing")
+
+                  shutil.copy2(
+                      code, firmware / "OVMF_CODE.fd"
+                  )
+                  shutil.copy2(
+                      vars_file, firmware / "OVMF_VARS.fd"
+                  )
+
+                  shutil.copytree(
+                      shared,
+                      firmware / "qemu",
+                      dirs_exist_ok=True
+                  )
+
+                  manifest = project / "QEMU_PACKAGE_MANIFEST.txt"
+                  manifest.write_text(
+                      "\n".join(
+                          p["Package"] + " " + p.get("Version", "?")
+                          for p in selected
+                      ) + "\n"
+                  )
+
+                  print("QEMU packaged:", destination)
+                  print("Native files:", len(elf_files))
+                  print("Firmware included")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python3 /tmp/bundle_qemu.py --project .
 
       - name: Build CatCore APK
         run: |
           gradle :app:assembleDebug --no-daemon
 
-      - name: Verify QEMU engine in APK
+      - name: Verify QEMU files inside APK
         run: |
           python3 - <<'PY'
-          from pathlib import Path
           import zipfile
+          from pathlib import Path
 
           apks = list(
-              Path('app/build/outputs/apk/debug')
-              .glob('*.apk')
+              Path("app/build/outputs/apk/debug").glob("*.apk")
           )
 
           if not apks:
-              raise SystemExit('APK not found')
+              raise SystemExit("APK not found")
 
           required = {
-              'lib/arm64-v8a/libqemu-system-x86_64.so',
-              'assets/firmware/OVMF_CODE.fd',
-              'assets/firmware/OVMF_VARS.fd',
+              "lib/arm64-v8a/libqemu-system-x86_64.so",
+              "assets/firmware/OVMF_CODE.fd",
+              "assets/firmware/OVMF_VARS.fd"
           }
 
-          with zipfile.ZipFile(apks[0]) as apk:
-              names = set(apk.namelist())
-              missing = required - names
+          with zipfile.ZipFile(apks[0]) as z:
+              files = set(z.namelist())
+              missing = required - files
 
               if not any(
-                  f'assets/firmware/qemu/{x}' in names
-                  for x in ('bios.bin', 'bios-256k.bin')
+                  f"assets/firmware/qemu/{name}" in files
+                  for name in ("bios.bin", "bios-256k.bin")
               ):
-                  missing.add('QEMU BIOS')
+                  missing.add("QEMU BIOS")
 
               if missing:
                   raise SystemExit(
-                      f'Missing QEMU files: {sorted(missing)}'
+                      "Incomplete APK: " + str(sorted(missing))
                   )
 
-          print('QEMU files packaged successfully')
+          print("QEMU engine and firmware included")
+          print("Android runtime still requires testing")
           PY
 
       - name: Upload CatCore APK
