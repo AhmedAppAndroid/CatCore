@@ -43,12 +43,13 @@ jobs:
 
           apk add --no-cache build-base linux-headers python3 py3-pip py3-setuptools py3-wheel \
             pkgconf curl tar xz meson coreutils grep sed gawk diffutils findutils \
-            glib-dev glib-static pcre2-dev libffi-dev zlib-dev zlib-static musl-libintl pixman-dev
+            glib-dev glib-static pcre2-dev libffi-dev zlib-dev zlib-static gettext-dev pixman-dev
           apk add --no-cache ninja || apk add --no-cache samurai
           for p in pixman-static pcre2-static libffi-static gettext-static; do
             apk add --no-cache "$p" || echo "package $p not available, continuing"
           done
 
+          ls -l /usr/lib/libintl* || true
           test -f /usr/lib/libglib-2.0.a || { echo "glib static library missing"; exit 1; }
           test -f /usr/lib/libz.a || { echo "zlib static library missing"; exit 1; }
 
