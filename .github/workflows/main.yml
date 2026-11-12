@@ -12,37 +12,76 @@ jobs:
     timeout-minutes: 75
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
-      - uses: gradle/actions/setup-gradle@v4
+          SDK_MANAGER="$(command -v sdkmanager || true)"
+
+          if [ -z "$SDK_MANAGER" ]; then
+            SDK_MANAGER="$(find "$SDK_ROOT/cmdline-tools" \
+              -type f -path '*/bin/sdkmanager' \
+              2>/dev/null | sort -V | tail -n 1)"
+          fi
+
+          if [ -z "$SDK_MANAGER" ] || [ ! -x "$SDK_MANAGER" ]; then
+            echo "::error::sdkmanager not found"
+            exit 1
+          fi
+
+          yes | "$SDK_MANAGER" \
+            --sdk_root="$SDK_ROOT" --licenses \
+            > /tmp/licenses.log 2>&1 || true
+
+          tail -n 12 /tmp/licenses.log
+
+          "$SDK_MANAGER" --sdk_root="$SDK_ROOT" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Install ELF patching dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y patchelf binutils
 
-      - name: Fetch and package QEMU + its ARM64 libraries and UEFI ROMs
-        run: python3 tools/bundle_qemu.py --project .
+      - name: Download and package QEMU ARM64
+        run: |
+          python3 tools/bundle_qemu.py --project .
 
-      - name: Compile Android app
-        run: gradle :app:assembleDebug --no-daemon
+      - name: Build CatCore APK
+        run: |
+          gradle :app:assembleDebug --no-daemon
 
-      - name: Fail if engine or firmware is absent from produced APK
+      - name: Verify QEMU engine in APK
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import zipfile
 
-          apk = next(Path('app/build/outputs/apk/debug').glob('*.apk'))
+          apks = list(
+              Path('app/build/outputs/apk/debug')
+              .glob('*.apk')
+          )
+
+          if not apks:
+              raise SystemExit('APK not found')
 
           required = {
               'lib/arm64-v8a/libqemu-system-x86_64.so',
@@ -50,26 +89,28 @@ jobs:
               'assets/firmware/OVMF_VARS.fd',
           }
 
-          with zipfile.ZipFile(apk) as z:
-              names = set(z.namelist())
+          with zipfile.ZipFile(apks[0]) as apk:
+              names = set(apk.namelist())
               missing = required - names
 
               if not any(
                   f'assets/firmware/qemu/{x}' in names
                   for x in ('bios.bin', 'bios-256k.bin')
               ):
-                  missing.add('assets/firmware/qemu/bios.bin (or bios-256k.bin)')
+                  missing.add('QEMU BIOS')
 
               if missing:
-                  raise SystemExit('INCOMPLETE APK: ' + repr(sorted(missing)))
+                  raise SystemExit(
+                      f'Missing QEMU files: {sorted(missing)}'
+                  )
 
-              print('QEMU engine and firmware packaged.')
-              print('Android runtime boot is not yet verified.')
+          print('QEMU files packaged successfully')
           PY
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload CatCore APK
+        uses: actions/upload-artifact@v4
         with:
-          name: CatCore-ARM64-QEMU-debug-apk
+          name: CatCore-QEMU-ARM64-APK
           path: |
             app/build/outputs/apk/debug/*.apk
             QEMU_PACKAGE_MANIFEST.txt
